@@ -499,6 +499,28 @@
   .toast.show { opacity: 1; }
   .toast.err { background: var(--vault); border-left-color: #fecaca; }
 
+
+  /* account gate */
+  .gate {
+    position: fixed; inset: 0; z-index: 100;
+    background: var(--bg);
+    background-image: radial-gradient(circle at 20% 10%, rgba(29, 78, 216, 0.10) 0, transparent 45%), radial-gradient(circle at 85% 80%, rgba(124, 31, 13, 0.06) 0, transparent 40%);
+    display: flex; align-items: flex-start; justify-content: center; padding: 12vh 16px 16px; overflow-y: auto;
+  }
+  .gate.hide { display: none; }
+  .gate-card {
+    width: 100%; max-width: 380px; background: var(--paper);
+    border: 1px solid var(--ink); border-top: 4px solid var(--blue); border-radius: 4px;
+    box-shadow: 3px 3px 0 var(--ink); padding: 18px;
+  }
+  .gate-card .t1 { font-size: 26px; margin-bottom: 6px; }
+  .gate-sub { font-style: italic; color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .gate-msg { min-height: 36px; margin-top: 10px; font-size: 12px; color: var(--vault); }
+  .gate-msg.ok { color: var(--blue); }
+  .sync-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--ink); background: var(--blue); margin-left: 6px; vertical-align: middle; }
+  .sync-dot.pending { background: var(--protag); }
+  .sync-dot.error { background: #f87171; }
+
   #print-root { display: none; }
   @media print {
     body { display: block; height: auto; overflow: visible; background: #fff; }
@@ -518,7 +540,7 @@
 <header class="topbar">
   <button class="icon-btn" id="menu-btn" aria-label="Menu">&#9776;</button>
   <div class="title-wrap">
-    <div class="t1">Estate Dossier <b>v1</b></div>
+    <div class="t1">Estate Dossier <b>v1</b><span class="sync-dot" id="sync-dot" title="saved"></span></div>
     <div class="t2" id="profile-line">no profile</div>
   </div>
   <div class="status-chip" id="status-chip">living</div>
@@ -571,7 +593,7 @@
     <button class="sheet-close" id="drawer-close" aria-label="Close menu">&times;</button>
   </div>
   <div class="drawer-body" id="drawer-body"></div>
-  <div class="drawer-foot">Prototype. Data stays in this browser only (localStorage). Back up with Export full backup.</div>
+  <div class="drawer-foot">Everything saves to your account, encrypted on the server. Export full backup for an offline copy.</div>
 </aside>
 
 <div class="scrim" id="sheet-scrim"></div>
@@ -584,6 +606,21 @@
   <div class="sheet-body" id="sheet-body"></div>
 </div>
 
+<div class="gate" id="gate">
+  <div class="gate-card">
+    <div class="t1">Estate Dossier <b>v1</b></div>
+    <div class="gate-sub">Sign in to open your dossiers. Everything you enter saves to your account.</div>
+    <div class="seg" style="grid-template-columns:1fr 1fr">
+      <button data-mode="in" class="on">Sign in</button>
+      <button data-mode="up">Create account</button>
+    </div>
+    <div class="field"><label>Email</label><input id="g-email" type="email" autocomplete="username" inputmode="email"></div>
+    <div class="field"><label>Password</label><input id="g-pass" type="password" autocomplete="current-password"></div>
+    <div class="field" id="g-pass2-wrap" style="visibility:hidden"><label>Confirm password</label><input id="g-pass2" type="password" autocomplete="new-password"></div>
+    <button class="btn blue" id="g-go" style="width:100%">Sign in</button>
+    <div class="gate-msg" id="g-msg"></div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 <input type="file" id="file-scan" accept="application/json,.json" hidden>
 <input type="file" id="file-backup" accept="application/json,.json" hidden>
@@ -594,7 +631,6 @@
 // ============================================================
 //  CONSTANTS
 // ============================================================
-const STORE_KEY = "estate_dossier_v1";
 const SAMPLE_SCAN_URL = "2026-11-24-blue-estate-dossier-v1-sample-exposure.json";
 
 const CATS = [
@@ -797,21 +833,63 @@ function blankState() {
 function validState(s) {
   return s && s.version === 1 && ["persons", "contracts", "subjects", "accounts", "exposures", "tasks", "audit"].every(k => Array.isArray(s[k]));
 }
-function loadState() {
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    if (raw) { const s = JSON.parse(raw); if (validState(s)) return s; }
-  } catch (e) { /* fall through to seed */ }
-  const s = blankState(); seedDemo(s); return s;
-}
-let S = loadState();
+let S = blankState();
+
+// ============================================================
+//  ACCOUNT AND SYNC
+// ============================================================
+const API = "/api";
+const AUTH_KEY = "estate_dossier_auth";
+const LEGACY_KEY = "estate_dossier_v1";
+let AUTH = (() => { try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || {}; } catch (e) { return {}; } })();
+const SYNC = { rev: 0, timer: null, inflight: false, dirty: false, ready: false };
 let persistTimer = null;
+
+async function api(method, path, body, opts) {
+  const headers = { "Content-Type": "application/json" };
+  if (AUTH.token) headers.Authorization = "Bearer " + AUTH.token;
+  let r;
+  try { r = await fetch(API + path, { method, headers, body: body ? JSON.stringify(body) : undefined, keepalive: !!(opts && opts.keepalive), cache: "no-store" }); }
+  catch (e) { const err = new Error("Server not reachable"); err.status = 0; throw err; }
+  let j = null; try { j = await r.json(); } catch (e) { /* non json */ }
+  if (!r.ok) { const err = new Error((j && j.error) || (r.status === 404 ? "Server not connected yet" : "Server error " + r.status)); err.status = r.status; err.body = j; throw err; }
+  return j;
+}
+function cacheKey() { return "estate_dossier_cache_" + (AUTH.user_id || "none"); }
+function cacheWrite(dirty) {
+  try { localStorage.setItem(cacheKey(), JSON.stringify({ rev: SYNC.rev, dirty: !!dirty, state: S })); } catch (e) { /* storage full */ }
+}
+function cacheRead() { try { const c = JSON.parse(localStorage.getItem(cacheKey())); return c && validState(c.state) ? c : null; } catch (e) { return null; } }
+function setSync(st) {
+  const d = document.getElementById("sync-dot"); if (!d) return;
+  d.className = "sync-dot" + (st === "saved" ? "" : " " + st);
+  d.title = st === "saved" ? "saved to account" : st === "pending" ? "saving" : "not saved yet, retrying";
+}
 function persist() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); }
-  catch (e) { toast("Browser storage is full or blocked", "err"); }
+  if (!SYNC.ready) return;
+  SYNC.dirty = true; cacheWrite(true); setSync("pending");
+  clearTimeout(SYNC.timer); SYNC.timer = setTimeout(pushState, 900);
 }
 function persistSoon() { clearTimeout(persistTimer); persistTimer = setTimeout(persist, 350); }
-persist();
+async function pushState() {
+  if (!SYNC.ready || !SYNC.dirty) return;
+  if (SYNC.inflight) { clearTimeout(SYNC.timer); SYNC.timer = setTimeout(pushState, 600); return; }
+  SYNC.inflight = true; SYNC.dirty = false;
+  try {
+    const j = await api("PUT", "/state", { rev: SYNC.rev, state: S });
+    SYNC.rev = j.rev; cacheWrite(SYNC.dirty); if (!SYNC.dirty) setSync("saved");
+  } catch (e) {
+    if (e.status === 409 && e.body && validState(e.body.state)) {
+      S = e.body.state; SYNC.rev = e.body.rev; cacheWrite(false); setSync("saved");
+      renderAll(); toast("Loaded newer changes from another device");
+    } else if (e.status === 401) { signOut(true); toast("Signed out, sign in again", "err"); }
+    else { SYNC.dirty = true; setSync("error"); clearTimeout(SYNC.timer); SYNC.timer = setTimeout(pushState, 5000); }
+  } finally { SYNC.inflight = false; }
+}
+function flushNow() {
+  if (!SYNC.ready || !SYNC.dirty || SYNC.inflight) return;
+  clearTimeout(SYNC.timer); pushState();
+}
 
 function cur() {
   let subject = S.subjects.find(x => x.subject_id === S.active) || S.subjects[0];
@@ -1139,7 +1217,10 @@ function buildMap() {
   const c = cur();
   const accts = c ? accountsOf(c.sid) : [];
   const groups = CATS.map(k => ({ cat: k, children: accts.filter(a => a.category === k.key).map(a => ({ a })) })).filter(x => x.children.length);
-  $("#map-empty").classList.toggle("show", !!c && accts.length === 0);
+  const empty = $("#map-empty");
+  empty.classList.toggle("show", SYNC.ready && accts.length === 0);
+  empty.querySelector("p").textContent = c ? "No accounts on this profile yet." : "No profiles on this account yet.";
+  $("#empty-intake").textContent = c ? "Start intake" : "Create profile";
   if (M.cat && !groups.find(x => x.cat.key === M.cat)) { M.cat = null; M.leafId = null; }
   if (M.leafId && !accts.find(a => a.account_id === M.leafId)) M.leafId = null;
 
@@ -1204,7 +1285,7 @@ function buildMap() {
   } else {
     center.append("circle").attr("class", "center-ring").attr("r", 42);
   }
-  center.append("text").attr("class", "center-name").attr("y", -1).text(shortName(c ? c.person.full_legal_name : "No profile"));
+  center.append("text").attr("class", "center-name").attr("y", -1).text(c ? shortName(c.person.full_legal_name) : "No profile");
   center.append("text").attr("class", "center-meta").attr("y", 11).text(c ? (c.subject.case_id || "") : "");
 
   const mb = $("#map-brokers");
@@ -2147,13 +2228,17 @@ function renderDrawer() {
     const n = accountsOf(s.subject_id).length;
     return `<button class="menu-item ${c && s.subject_id === c.sid ? "on" : ""}" data-prof="${s.subject_id}">${esc(p.full_legal_name || "Unnamed")}<small>${esc(s.case_id || "")} · ${n} accounts · ${esc(p.death_status || "living")}${s.demo ? " · demo" : ""}</small></button>`;
   }).join("");
+  const acct = `<div class="menu-item" style="cursor:default">${esc(AUTH.email || "")}<small>signed in · ${S.subjects.length} profile${S.subjects.length === 1 ? "" : "s"} saved to this account</small></div>`;
   const sec = (id, title, inner) => `<details data-sec="${id}" ${drawerOpenSections.has(id) ? "open" : ""}><summary>${title}</summary>${inner}</details>`;
   const item = (act, label, sub) => `<button class="menu-item" data-act="${act}">${label}${sub ? `<small>${sub}</small>` : ""}</button>`;
   $("#drawer-body").innerHTML =
-    sec("profiles", "Profiles", profiles +
+    sec("account", "Account", acct +
+      item("signout", "Sign out", "saves first, then locks the app") +
+      item("delacct", "Delete account", "erases the account and every dossier on it")) +
+    sec("profiles", "Profiles", (profiles || `<div class="menu-item muted" style="cursor:default">No profiles yet</div>`) +
       item("new", "+ New profile", "starts the intake wizard") +
       item("dup", "Duplicate active profile", "copies identity and accounts") +
-      item("del", "Delete active profile", "removes it from this browser")) +
+      item("del", "Delete active profile", "removes it from this account")) +
     sec("data", "Import and export",
       item("m01", "Module 01 identity export", "scrub.subject_identity.v1 JSON") +
       item("scan", "Import broker scan", "scrub.exposure_checklist.v1 JSON") +
@@ -2161,13 +2246,13 @@ function renderDrawer() {
       item("csv", "Export CSV", "accounts, brokers, contacts, tasks, audit") +
       item("print", "Print executor packet", "save as PDF from the print dialog") +
       item("backup", "Export full backup", "every profile, JSON") +
-      item("restore", "Restore backup", "replaces everything in this browser")) +
+      item("restore", "Restore backup", "replaces everything on this account")) +
     sec("records", "Records",
       item("profile", "Subject summary", "identity and contract at a glance") +
       item("contract", "Edit contract", "jumps to the intake contract step") +
       item("audit", "Audit log", "every operator action")) +
-    sec("proto", "Prototype",
-      item("reset", "Reset to demo data", "wipes this browser and reloads the demo"));
+    sec("proto", "Demo",
+      item("demo", "Load demo profile", "adds the Marcus Chen-Whitfield sample"));
   $("#drawer-body").querySelectorAll("details").forEach(d => d.ontoggle = () => {
     if (d.open) drawerOpenSections.add(d.dataset.sec); else drawerOpenSections.delete(d.dataset.sec);
   });
@@ -2198,7 +2283,7 @@ function menuAction(act) {
     }
     case "del": {
       if (!c) return;
-      if (!confirm("Delete " + (c.person.full_legal_name || "this profile") + " with all accounts, brokers and tasks from this browser?")) return;
+      if (!confirm("Delete " + (c.person.full_legal_name || "this profile") + " with all accounts, brokers and tasks?")) return;
       const sid = c.sid;
       S.subjects = S.subjects.filter(x => x.subject_id !== sid);
       if (!S.subjects.some(x => x.person_id === c.subject.person_id)) S.persons = S.persons.filter(x => x.person_id !== c.subject.person_id);
@@ -2221,11 +2306,19 @@ function menuAction(act) {
     case "profile": if (VIEW !== "map") setView("map"); setTimeout(openSubjectSheet, 50); break;
     case "contract": intakeStep = 2; setView("intake"); break;
     case "audit": openAudit(); break;
-    case "reset": {
-      if (!confirm("Wipe every profile in this browser and reload the demo data?")) return;
-      S = blankState(); seedDemo(S); persist();
+    case "demo": {
+      seedDemo(S); log("demo_loaded", {}); persist();
       M.cat = null; M.leafId = null; M.broker = false; M.brokerId = null; M.t = d3.zoomIdentity;
-      renderAll(); toast("Reset to demo data"); break;
+      renderAll(); toast("Demo profile added"); break;
+    }
+    case "signout": signOut(false); break;
+    case "delacct": {
+      const pw = prompt("Type your password to delete this account and every dossier on it");
+      if (!pw) return;
+      api("DELETE", "/account", { password: pw })
+        .then(() => { signOut(true); gMsg("Account deleted.", true); })
+        .catch(e => toast(e.message, "err"));
+      break;
     }
   }
 }
@@ -2388,7 +2481,7 @@ function exportBackup() {
 }
 function restoreBackup(j) {
   if (!validState(j)) { toast("Not an Estate Dossier backup", "err"); return; }
-  if (!confirm(`Replace everything in this browser with the backup (${j.subjects.length} profiles)?`)) return;
+  if (!confirm(`Replace everything on this account with the backup (${j.subjects.length} profiles)?`)) return;
   delete j.exported_at; delete j.app;
   S = j; log("backup_restored", { profiles: j.subjects.length }); persist();
   M.cat = null; M.leafId = null; M.broker = false; M.brokerId = null; M.t = d3.zoomIdentity;
@@ -2455,7 +2548,7 @@ $("#zoom-in").onclick = () => M.svg && M.svg.transition().duration(250).call(M.z
 $("#zoom-out").onclick = () => M.svg && M.svg.transition().duration(250).call(M.zoom.scaleBy, 1 / 1.35);
 $("#zoom-reset").onclick = clearFocus;
 $("#map-brokers").onclick = enterBrokers;
-$("#empty-intake").onclick = () => { intakeStep = 3; setView("intake"); };
+$("#empty-intake").onclick = () => { if (!cur()) { menuAction("new"); return; } intakeStep = 3; setView("intake"); };
 $("#file-scan").onchange = e => { const f = e.target.files[0]; if (f) readJsonFile(f, importScan); e.target.value = ""; };
 $("#file-backup").onchange = e => { const f = e.target.files[0]; if (f) readJsonFile(f, restoreBackup); e.target.value = ""; };
 window.addEventListener("afterprint", () => { $("#print-root").innerHTML = ""; });
@@ -2468,10 +2561,87 @@ document.addEventListener("drop", e => {
 });
 let resizeTimer = null;
 new ResizeObserver(() => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { if (VIEW === "map") buildMap(); }, 160); }).observe($("#map-wrap"));
-window.addEventListener("beforeunload", () => { clearTimeout(persistTimer); persist(); });
+// ============================================================
+//  SIGN IN GATE
+// ============================================================
+let gateMode = "in";
+function gMsg(t, ok) { const m = $("#g-msg"); m.textContent = t || ""; m.className = "gate-msg" + (ok ? " ok" : ""); }
+function showGate(msg) { $("#gate").classList.remove("hide"); gMsg(msg || ""); }
+function hideGate() { $("#gate").classList.add("hide"); gMsg(""); }
+document.querySelectorAll("#gate [data-mode]").forEach(b => b.onclick = () => {
+  gateMode = b.dataset.mode;
+  document.querySelectorAll("#gate [data-mode]").forEach(x => x.classList.toggle("on", x === b));
+  $("#g-pass2-wrap").style.visibility = gateMode === "up" ? "visible" : "hidden";
+  $("#g-go").textContent = gateMode === "up" ? "Create account" : "Sign in";
+  $("#g-pass").setAttribute("autocomplete", gateMode === "up" ? "new-password" : "current-password");
+  gMsg("");
+});
+["#g-email", "#g-pass", "#g-pass2"].forEach(s => $(s).onkeydown = e => { if (e.key === "Enter") submitGate(); });
+$("#g-go").onclick = submitGate;
+async function submitGate() {
+  const email = $("#g-email").value.trim(), pw = $("#g-pass").value;
+  if (!email || !pw) { gMsg("Enter your email and password."); return; }
+  if (gateMode === "up") {
+    if (pw.length < 10) { gMsg("Password needs at least 10 characters."); return; }
+    if (pw !== $("#g-pass2").value) { gMsg("Passwords do not match."); return; }
+  }
+  const btn = $("#g-go"); btn.disabled = true; gMsg("Working on it...", true);
+  try {
+    const j = await api("POST", gateMode === "up" ? "/signup" : "/login", { email, password: pw });
+    AUTH = { token: j.token, user_id: j.user_id, email: j.email };
+    localStorage.setItem(AUTH_KEY, JSON.stringify(AUTH));
+    $("#g-pass").value = ""; $("#g-pass2").value = "";
+    await loadAccount();
+  } catch (e) { gMsg(e.message); }
+  finally { btn.disabled = false; }
+}
+async function loadAccount() {
+  let remote = null;
+  try { remote = await api("GET", "/state"); }
+  catch (e) { if (e.status === 401) { signOut(true); gMsg("Session expired. Sign in again."); return; } }
+  const cache = cacheRead();
+  if (remote) {
+    SYNC.rev = remote.rev;
+    if (cache && cache.dirty && cache.rev === remote.rev) { S = cache.state; SYNC.ready = true; persist(); }
+    else if (remote.state && validState(remote.state)) { S = remote.state; SYNC.ready = true; cacheWrite(false); setSync("saved"); }
+    else {
+      let legacy = null;
+      try { const l = JSON.parse(localStorage.getItem(LEGACY_KEY)); if (validState(l)) legacy = l; } catch (e) { /* none */ }
+      S = legacy || blankState(); SYNC.ready = true;
+      if (legacy) { localStorage.removeItem(LEGACY_KEY); toast("Moved this browser's dossiers into your account"); }
+      persist();
+    }
+  } else if (cache) {
+    S = cache.state; SYNC.rev = cache.rev; SYNC.ready = true; SYNC.dirty = !!cache.dirty;
+    setSync(cache.dirty ? "error" : "saved"); toast("Offline, showing the saved copy", "err");
+    if (SYNC.dirty) SYNC.timer = setTimeout(pushState, 5000);
+  } else { showGate("Server not reachable. Try again in a moment."); return; }
+  M.cat = null; M.leafId = null; M.broker = false; M.brokerId = null; M.t = d3.zoomIdentity;
+  hideGate(); renderChrome(); setView(VIEW || "map");
+}
+async function signOut(silent) {
+  if (!silent && SYNC.ready && SYNC.dirty) { clearTimeout(SYNC.timer); await pushState(); }
+  if (!silent) { try { await api("POST", "/logout"); } catch (e) { /* offline */ } }
+  try { localStorage.removeItem(cacheKey()); } catch (e) { /* ignore */ }
+  AUTH = {}; localStorage.removeItem(AUTH_KEY);
+  SYNC.ready = false; SYNC.dirty = false; SYNC.rev = 0; clearTimeout(SYNC.timer);
+  S = blankState(); closeSheet(true); closeDrawer(); renderChrome(); setSync("saved");
+  showGate("");
+}
+document.addEventListener("visibilitychange", () => { if (document.hidden) { clearTimeout(persistTimer); if (SYNC.ready) { persist(); flushNow(); } } });
+window.addEventListener("beforeunload", () => {
+  clearTimeout(persistTimer);
+  if (!SYNC.ready) return;
+  cacheWrite(true);
+  const body = JSON.stringify({ rev: SYNC.rev, state: S });
+  if (body.length < 60000 && AUTH.token) {
+    try { fetch(API + "/state", { method: "PUT", keepalive: true, headers: { "Content-Type": "application/json", Authorization: "Bearer " + AUTH.token }, body }); } catch (e) { /* best effort */ }
+  }
+});
 
 renderChrome();
-setView("map");
+if (AUTH.token) { gMsg("Loading your dossiers...", true); loadAccount(); }
+else showGate("");
 </script>
 </body>
 </html>
